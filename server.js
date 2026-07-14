@@ -56,61 +56,112 @@ function safeParse(str) {
   try { return JSON.parse(str); } catch { return null; }
 }
 
-async function listSheetTitles() {
-  const meta = await sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
-  return (meta.data.sheets || []).map(s => s.properties.title);
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// เรียก Google API พร้อม retry แบบ backoff เมื่อเจอ rate limit (429 / RESOURCE_EXHAUSTED)
+async function withRetry(fn, retries = 4) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const code = err.code || (err.response && err.response.status);
+      const isRateLimit = code === 429 || /quota|rate limit/i.test(err.message || '');
+      if (!isRateLimit || i === retries) throw err;
+      await sleep(1000 * Math.pow(2, i)); // 1s, 2s, 4s, 8s...
+    }
+  }
+  throw lastErr;
 }
 
-async function ensureSheetExists(title) {
-  const titles = await listSheetTitles();
-  if (titles.includes(title)) return;
-  await sheetsApi.spreadsheets.batchUpdate({
-    spreadsheetId: SPREADSHEET_ID,
-    requestBody: { requests: [{ addSheet: { properties: { title } } }] },
-  });
-  // ใส่หัวคอลัมน์อธิบาย
-  await sheetsApi.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `'${title}'!A1:B1`,
-    valueInputOption: 'RAW',
-    requestBody: { values: [['ข้อมูล (JSON)', 'อัปเดตล่าสุด']] },
-  });
+async function listSheetTitles() {
+  const meta = await withRetry(() => sheetsApi.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID }));
+  return (meta.data.sheets || []).map(s => s.properties.title);
 }
 
 async function readBucket(bucket) {
   const title = safeSheetName(bucket);
   const titles = await listSheetTitles();
   if (!titles.includes(title)) return null;
-  const res = await sheetsApi.spreadsheets.values.get({
+  const res = await withRetry(() => sheetsApi.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: `'${title}'!A2:A2`,
-  });
+  }));
   const val = res.data.values && res.data.values[0] && res.data.values[0][0];
   return safeParse(val);
 }
 
+// เขียน bucket เดียว — ลองเขียนตรงๆ ก่อน (1 API call) ถ้าชีตยังไม่มีค่อยสร้างแล้วลองใหม่
+// (ใช้กับ auto-sync ที่ยิงทีละ bucket ตอนมีการบันทึกข้อมูล)
 async function writeBucket(bucket, data) {
   const title = safeSheetName(bucket);
-  await ensureSheetExists(title);
-  await sheetsApi.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `'${title}'!A2:B2`,
-    valueInputOption: 'RAW',
-    requestBody: { values: [[JSON.stringify(data === undefined ? null : data), new Date().toISOString()]] },
-  });
+  const values = [[JSON.stringify(data === undefined ? null : data), new Date().toISOString()]];
+  try {
+    await withRetry(() => sheetsApi.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `'${title}'!A2:B2`,
+      valueInputOption: 'RAW',
+      requestBody: { values },
+    }));
+  } catch (err) {
+    // ชีตยังไม่มี → สร้างแล้วลองเขียนใหม่ (รวม header ไปด้วย)
+    await withRetry(() => sheetsApi.spreadsheets.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: { requests: [{ addSheet: { properties: { title } } }] },
+    }));
+    await withRetry(() => sheetsApi.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `'${title}'!A1:B2`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [['ข้อมูล (JSON)', 'อัปเดตล่าสุด'], values[0]] },
+    }));
+  }
 }
 
-async function readAllBuckets() {
-  const titles = await listSheetTitles();
-  const result = {};
-  for (const title of titles) {
-    const res = await sheetsApi.spreadsheets.values.get({
+// เขียนทุก bucket พร้อมกันด้วย batchUpdate เดียว — ไม่ว่าจะมีกี่ประเภทข้อมูล
+// ก็ใช้แค่ ~3 API calls รวม (กัน quota "write requests per minute" หมด)
+async function writeAllBucketsBatch(dataMap) {
+  const items = Object.keys(dataMap).map(bucket => ({ bucket, title: safeSheetName(bucket) }));
+  if (!items.length) return;
+
+  const existingTitles = await listSheetTitles(); // 1 call
+  const missing = items.filter(it => !existingTitles.includes(it.title));
+  if (missing.length) {
+    await withRetry(() => sheetsApi.spreadsheets.batchUpdate({
       spreadsheetId: SPREADSHEET_ID,
-      range: `'${title}'!A2:A2`,
-    });
-    const val = res.data.values && res.data.values[0] && res.data.values[0][0];
-    result[title] = safeParse(val);
+      requestBody: { requests: missing.map(it => ({ addSheet: { properties: { title: it.title } } })) },
+    })); // 1 call สร้างชีตที่ขาดทั้งหมดพร้อมกัน
   }
+
+  const data = items.map(it => ({
+    range: `'${it.title}'!A1:B2`,
+    values: [
+      ['ข้อมูล (JSON)', 'อัปเดตล่าสุด'],
+      [JSON.stringify(dataMap[it.bucket] === undefined ? null : dataMap[it.bucket]), new Date().toISOString()],
+    ],
+  }));
+  await withRetry(() => sheetsApi.spreadsheets.values.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: { valueInputOption: 'RAW', data },
+  })); // 1 call เขียนข้อมูลทุก bucket พร้อมกัน
+}
+
+// อ่านทุก bucket พร้อมกันด้วย batchGet เดียว
+async function readAllBuckets() {
+  const titles = await listSheetTitles(); // 1 call
+  if (!titles.length) return {};
+  const ranges = titles.map(t => `'${t}'!A2:A2`);
+  const res = await withRetry(() => sheetsApi.spreadsheets.values.batchGet({
+    spreadsheetId: SPREADSHEET_ID,
+    ranges,
+  })); // 1 call
+  const result = {};
+  titles.forEach((title, i) => {
+    const vr = res.data.valueRanges[i];
+    const val = vr && vr.values && vr.values[0] && vr.values[0][0];
+    result[title] = safeParse(val);
+  });
   return result;
 }
 
@@ -155,9 +206,7 @@ app.post('/', async (req, res) => {
 
       case 'setAll': {
         const data = body.data || {};
-        for (const bucket of Object.keys(data)) {
-          await writeBucket(bucket, data[bucket]);
-        }
+        await writeAllBucketsBatch(data);
         return res.json({ ok: true, count: Object.keys(data).length });
       }
 
