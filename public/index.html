@@ -1876,10 +1876,10 @@ tr:hover td{background:var(--gray-50);}
             <div class="card-body">
               <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:14px 16px;margin-bottom:16px;font-size:12.5px;color:var(--gray-700);line-height:1.8;">
                 <strong>วิธีตั้งค่า (ทำครั้งเดียว):</strong>
-                1) เปิดไฟล์ <code>Code.gs</code> ที่แนบมา นำไปวางใน Google Apps Script (script.google.com) ที่ผูกกับ Google Sheet ของท่าน &nbsp;
-                2) แก้ค่า SECRET_TOKEN ในสคริปต์เป็นรหัสลับของท่านเอง &nbsp;
-                3) Deploy เป็น Web app (Execute as: Me, Who has access: Anyone) &nbsp;
-                4) คัดลอก URL ที่ได้ (ลงท้ายด้วย /exec) มาใส่ด้านล่างพร้อม Token เดียวกัน
+                1) Deploy โปรเจกต์ backend (sarabun-sync-api) ขึ้น Railway ผ่าน GitHub &nbsp;
+                2) ตั้งค่า Environment Variables ใน Railway ให้ครบ: SECRET_TOKEN, SPREADSHEET_ID, GOOGLE_CLIENT_EMAIL, GOOGLE_PRIVATE_KEY &nbsp;
+                3) คัดลอก URL ที่ Railway ให้มา (เช่น https://your-app.up.railway.app/) มาใส่ด้านล่าง &nbsp;
+                4) ใส่ Secret Token ให้ตรงกับค่า SECRET_TOKEN ที่ตั้งไว้ใน Railway (ไม่เกี่ยวกับ Google Apps Script แล้ว)
               </div>
               <div class="form-grid form-grid-2">
                 <div class="field"><label>Web App URL</label><input type="text" id="syncUrl" placeholder="https://script.google.com/macros/s/xxxx/exec"></div>
