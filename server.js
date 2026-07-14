@@ -23,15 +23,17 @@ app.use(cors());
 app.use(express.static(path.join(__dirname, 'public')));
 // รับ body เป็น text เสมอ (ฝั่งเว็บแอปส่งมาเป็น Content-Type: text/plain
 // เพื่อเลี่ยง CORS preflight) แล้วค่อย JSON.parse เอง
-app.use(express.text({ type: () => true, limit: '15mb' }));
+app.use(express.text({ type: () => true, limit: '25mb' }));
 
 const PORT = process.env.PORT || 3000;
 const SECRET_TOKEN = process.env.SECRET_TOKEN || '';
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID || '';
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || '';
 const GOOGLE_PRIVATE_KEY = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
 if (!SECRET_TOKEN) console.warn('⚠️  ยังไม่ได้ตั้งค่า SECRET_TOKEN — ควรตั้งก่อนใช้งานจริง');
+if (!ANTHROPIC_API_KEY) console.warn('⚠️  ยังไม่ได้ตั้งค่า ANTHROPIC_API_KEY — ฟีเจอร์ AI สแกนเอกสาร/สรุปโครงการจะใช้ไม่ได้');
 if (!SPREADSHEET_ID || !GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) {
   console.warn('⚠️  ยังตั้งค่า Google Sheets ไม่ครบ (SPREADSHEET_ID / GOOGLE_CLIENT_EMAIL / GOOGLE_PRIVATE_KEY)');
 }
@@ -170,6 +172,45 @@ async function readAllBuckets() {
 // health check (เดิมอยู่ที่ '/' ย้ายมาที่นี่ เพราะ '/' ตอนนี้เสิร์ฟหน้าเว็บแอปแทน)
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Sarabun Sync API is running' });
+});
+
+// ตัวกลางยิงไปหา Anthropic API แทนฝั่งเบราว์เซอร์ (กันเรื่อง CORS และไม่ต้องเผย API key ให้ผู้ใช้เห็น)
+// ฟีเจอร์ AI สแกนเอกสาร / สรุปโครงการอัตโนมัติ ในตัวแอปจะยิงมาที่นี่แทน api.anthropic.com ตรงๆ
+app.post('/api/ai', async (req, res) => {
+  let body;
+  try {
+    body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+  } catch (err) {
+    return res.status(400).json({ error: 'invalid request body: ' + err.message });
+  }
+
+  if ((body.token || '') !== SECRET_TOKEN) {
+    return res.status(401).json({ error: 'unauthorized: token ไม่ถูกต้อง' });
+  }
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: 'เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า ANTHROPIC_API_KEY' });
+  }
+
+  try {
+    const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: body.model || 'claude-sonnet-4-20250514',
+        max_tokens: body.max_tokens || 2000,
+        ...(body.system ? { system: body.system } : {}),
+        messages: body.messages || [],
+      }),
+    });
+    const data = await anthropicRes.json();
+    return res.status(anthropicRes.status).json(data);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/', async (req, res) => {
